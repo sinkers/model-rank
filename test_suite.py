@@ -39,17 +39,26 @@ SYSTEM_PROMPT = (
 
 # Search terms used to resolve model IDs from the OpenRouter models API.
 # Each value is (search_term, provider_preferences).
-# The search_term is matched against model IDs; the best (shortest non-free) match wins.
+#
+# Two modes:
+#   - Partial search term (e.g. "claude-haiku"): picks the shortest non-:free match
+#   - Exact model ID (contains "/"): used as-is; pair with {"order": [...]} to pin provider
 #
 # Provider prefs reference: https://openrouter.ai/docs/guides/routing/provider-selection
-#   {"sort": "latency"}                         — auto-pick fastest provider
-#   {"order": ["Anthropic"], "allow_fallbacks": False}  — hard-pin a provider
+#   {"sort": "latency"}                                  — auto-pick fastest provider
+#   {"order": ["Groq"], "allow_fallbacks": False}        — hard-pin a specific provider
 MODEL_SEARCHES: dict[str, tuple[str, dict]] = {
-    "Claude Haiku":  ("claude-haiku",  {"sort": "latency"}),
-    "GPT-4o":        ("gpt-4o",        {"sort": "latency"}),
-    "Kimi K2":       ("kimi-k2",       {"sort": "latency"}),
-    "MiniMax":       ("minimax-m",     {"sort": "latency"}),
-    "Qwen3":         ("qwen3",         {"sort": "latency"}),
+    # Top 10 fastest endpoints from /api/v1/models benchmarks (p50 latency, April 2026)
+    "Phi-4 (DeepInfra)":           ("microsoft/phi-4",                       {"order": ["DeepInfra"],  "allow_fallbacks": False}),
+    "Trinity Mini (Clarifai)":     ("arcee-ai/trinity-mini",                 {"order": ["Clarifai"],   "allow_fallbacks": False}),
+    "Llama Guard 4 12B":           ("meta-llama/llama-guard-4-12b",          {"order": ["Together"],   "allow_fallbacks": False}),
+    "Llama 3.1 8B (Friendli)":     ("meta-llama/llama-3.1-8b-instruct",     {"order": ["Friendli"],   "allow_fallbacks": False}),
+    "Lunaris 8B (DeepInfra)":      ("sao10k/l3-lunaris-8b",                  {"order": ["DeepInfra"],  "allow_fallbacks": False}),
+    "Ministral 3B (Mistral)":      ("mistralai/ministral-3b-2512",           {"order": ["Mistral"],    "allow_fallbacks": False}),
+    "Llama 3.1 8B (Groq)":         ("meta-llama/llama-3.1-8b-instruct",     {"order": ["Groq"],       "allow_fallbacks": False}),
+    "GPT-OSS 20B (Groq)":          ("openai/gpt-oss-20b",                    {"order": ["Groq"],       "allow_fallbacks": False}),
+    "Command R7B (Cohere)":        ("cohere/command-r7b-12-2024",            {"order": ["Cohere"],     "allow_fallbacks": False}),
+    "GPT-OSS Safeguard (Groq)":    ("openai/gpt-oss-safeguard-20b",          {"order": ["Groq"],       "allow_fallbacks": False}),
 }
 
 # Personal assistant style prompts
@@ -143,14 +152,21 @@ async def resolve_models(
 
     resolved: dict[str, tuple[str, dict]] = {}
     for display_name, (term, prefs) in searches.items():
+        # If term is already a full model ID (contains "/"), use it directly
+        if "/" in term:
+            if term in all_ids:
+                resolved[display_name] = (term, prefs)
+            else:
+                resolved[display_name] = (f"UNRESOLVED:{term}", prefs)
+            continue
+
+        # Otherwise treat as a search term — pick shortest non-:free match
         matches = [mid for mid in all_ids if term.lower() in mid.lower() and ":free" not in mid]
         if not matches:
-            # Fall back to including :free if nothing else matches
             matches = [mid for mid in all_ids if term.lower() in mid.lower()]
         if not matches:
             resolved[display_name] = (f"UNRESOLVED:{term}", prefs)
         else:
-            # Prefer the shortest ID — usually the canonical/flagship version
             best = min(matches, key=len)
             resolved[display_name] = (best, prefs)
 
