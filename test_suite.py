@@ -370,6 +370,283 @@ def print_per_model_averages(results: list[Result]) -> None:
     console.print(table)
 
 # ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+
+def _ttft_color(ttft_s: Optional[float]) -> str:
+    if ttft_s is None:
+        return "#888"
+    if ttft_s < 1.0:
+        return "#22c55e"   # green
+    if ttft_s < 3.0:
+        return "#eab308"   # yellow
+    if ttft_s < 8.0:
+        return "#f97316"   # orange
+    return "#ef4444"       # red
+
+
+def generate_html_report(results: list[Result], output_path: str = "results.html") -> None:
+    from collections import defaultdict
+    from datetime import datetime, timezone
+    from html import escape
+
+    run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # --- per-model aggregates ---
+    groups: dict[str, list[Result]] = defaultdict(list)
+    for r in results:
+        if not r.error:
+            groups[r.model_name].append(r)
+
+    def avg(vals: list[float]) -> Optional[float]:
+        return sum(vals) / len(vals) if vals else None
+
+    # -----------------------------------------------------------------------
+    # Summary cards
+    # -----------------------------------------------------------------------
+    cards_html = ""
+    # rank by avg TTFT (models with no TTFT go last)
+    def sort_key(item: tuple) -> float:
+        _, res = item
+        ttfts = [r.ttft_s for r in res if r.ttft_s is not None]
+        return avg(ttfts) if ttfts else 9999
+
+    for model_name, res in sorted(groups.items(), key=sort_key):
+        mid        = res[0].model_id
+        ttfts      = [r.ttft_s        for r in res if r.ttft_s        is not None]
+        totals     = [r.total_s       for r in res if r.total_s       is not None]
+        out_toks   = [r.output_tokens for r in res if r.output_tokens is not None]
+        costs      = [r.cost_usd      for r in res if r.cost_usd      is not None]
+
+        avg_ttft   = avg(ttfts)
+        avg_total  = avg(totals)
+        avg_out    = avg(out_toks)
+        total_cost = sum(costs) if costs else None
+
+        ttft_str  = f"{avg_ttft:.2f}s"        if avg_ttft   is not None else "—"
+        total_str = f"{avg_total:.2f}s"        if avg_total  is not None else "—"
+        out_str   = f"{avg_out:.0f}"           if avg_out    is not None else "—"
+        cost_str  = f"${total_cost:.6f}"       if total_cost is not None else "—"
+        color     = _ttft_color(avg_ttft)
+
+        cards_html += f"""
+        <div class="card">
+          <div class="card-name">{escape(model_name)}</div>
+          <div class="card-id">{escape(mid)}</div>
+          <div class="card-metrics">
+            <div class="metric">
+              <span class="metric-value" style="color:{color}">{ttft_str}</span>
+              <span class="metric-label">avg TTFT</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value">{total_str}</span>
+              <span class="metric-label">avg total</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value">{out_str}</span>
+              <span class="metric-label">avg tokens</span>
+            </div>
+            <div class="metric">
+              <span class="metric-value">{cost_str}</span>
+              <span class="metric-label">total cost</span>
+            </div>
+          </div>
+          <div class="card-ok">{len(res)}/{len(res) + sum(1 for r in results if r.model_name == model_name and r.error)} prompts OK</div>
+        </div>"""
+
+    # -----------------------------------------------------------------------
+    # Detail rows
+    # -----------------------------------------------------------------------
+    rows_html = ""
+    prev_model = None
+    for r in results:
+        model_class = "model-first" if r.model_name != prev_model else ""
+        prev_model = r.model_name
+
+        if r.error:
+            rows_html += f"""
+        <tr class="error-row {model_class}">
+          <td>{escape(r.model_name)}</td>
+          <td>{escape(r.prompt_label)}</td>
+          <td colspan="5" class="error-msg">{escape(r.error[:120])}</td>
+          <td><span class="badge badge-error">ERROR</span></td>
+        </tr>"""
+        else:
+            color    = _ttft_color(r.ttft_s)
+            ttft_str = f"{r.ttft_s:.2f}s"   if r.ttft_s        is not None else "—"
+            tot_str  = f"{r.total_s:.2f}s"  if r.total_s       is not None else "—"
+            tin_str  = str(r.input_tokens)  if r.input_tokens  is not None else "—"
+            tout_str = str(r.output_tokens) if r.output_tokens is not None else "—"
+            cost_str = f"${r.cost_usd:.6f}" if r.cost_usd      is not None else "—"
+            preview  = escape(r.response_text[:120]).replace("\n", " ")
+            if len(r.response_text) > 120:
+                preview += "…"
+            full_text = escape(r.response_text)
+
+            rows_html += f"""
+        <tr class="{model_class}">
+          <td><strong>{escape(r.model_name)}</strong></td>
+          <td>{escape(r.prompt_label)}</td>
+          <td style="color:{color};font-weight:600">{ttft_str}</td>
+          <td>{tot_str}</td>
+          <td>{tin_str}</td>
+          <td>{tout_str}</td>
+          <td>{cost_str}</td>
+          <td>
+            <details>
+              <summary class="response-preview">{preview}</summary>
+              <div class="response-full">{full_text}</div>
+            </details>
+          </td>
+        </tr>"""
+
+    # -----------------------------------------------------------------------
+    # Full HTML
+    # -----------------------------------------------------------------------
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model Rank — Results</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 2rem;
+      line-height: 1.5;
+    }}
+
+    h1 {{ font-size: 1.6rem; font-weight: 700; color: #f8fafc; }}
+    h2 {{ font-size: 1.1rem; font-weight: 600; color: #94a3b8; text-transform: uppercase;
+          letter-spacing: .08em; margin: 2rem 0 1rem; }}
+
+    .meta {{ color: #64748b; font-size: .85rem; margin-top: .3rem; }}
+
+    /* --- cards --- */
+    .cards {{ display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }}
+    .card {{
+      background: #1e2330;
+      border: 1px solid #2d3448;
+      border-radius: .75rem;
+      padding: 1.2rem 1.4rem;
+      min-width: 200px;
+      flex: 1 1 200px;
+    }}
+    .card-name {{ font-size: 1rem; font-weight: 700; color: #f1f5f9; }}
+    .card-id   {{ font-size: .72rem; color: #64748b; margin-top: .15rem; margin-bottom: .8rem;
+                  font-family: monospace; }}
+    .card-metrics {{ display: flex; gap: 1.2rem; flex-wrap: wrap; }}
+    .metric {{ display: flex; flex-direction: column; align-items: center; }}
+    .metric-value {{ font-size: 1.2rem; font-weight: 700; }}
+    .metric-label {{ font-size: .7rem; color: #64748b; text-transform: uppercase;
+                     letter-spacing: .06em; margin-top: .1rem; }}
+    .card-ok {{ font-size: .75rem; color: #475569; margin-top: .8rem; }}
+
+    /* --- table --- */
+    .table-wrap {{ overflow-x: auto; margin-top: 1rem; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .85rem;
+    }}
+    thead th {{
+      background: #1e2330;
+      color: #94a3b8;
+      text-transform: uppercase;
+      font-size: .72rem;
+      letter-spacing: .07em;
+      padding: .65rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid #2d3448;
+      white-space: nowrap;
+    }}
+    tbody tr {{ border-bottom: 1px solid #1e2330; }}
+    tbody tr:hover {{ background: #1a1f2e; }}
+    tbody tr.model-first {{ border-top: 2px solid #2d3448; }}
+    td {{ padding: .55rem 1rem; vertical-align: top; }}
+    .error-row td {{ color: #f87171; }}
+    .error-msg {{ font-family: monospace; font-size: .8rem; }}
+
+    /* --- badges --- */
+    .badge {{ display: inline-block; padding: .2rem .5rem; border-radius: .3rem;
+               font-size: .72rem; font-weight: 600; }}
+    .badge-error {{ background: #450a0a; color: #fca5a5; }}
+
+    /* --- response expand --- */
+    details summary {{
+      cursor: pointer;
+      list-style: none;
+      color: #64748b;
+      font-size: .8rem;
+    }}
+    details summary::-webkit-details-marker {{ display: none; }}
+    details[open] summary {{ color: #94a3b8; margin-bottom: .5rem; }}
+    .response-preview {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                         max-width: 320px; display: block; }}
+    .response-full {{
+      white-space: pre-wrap;
+      font-size: .82rem;
+      color: #cbd5e1;
+      background: #0f1117;
+      border: 1px solid #2d3448;
+      border-radius: .4rem;
+      padding: .75rem 1rem;
+      max-width: 600px;
+    }}
+
+    /* --- legend --- */
+    .legend {{ display: flex; gap: 1.5rem; font-size: .78rem; color: #64748b;
+               margin-top: .5rem; flex-wrap: wrap; }}
+    .legend-dot {{ width: 10px; height: 10px; border-radius: 50%;
+                   display: inline-block; margin-right: .3rem; }}
+  </style>
+</head>
+<body>
+  <h1>Model Rank</h1>
+  <p class="meta">Personal assistant benchmark via OpenRouter &nbsp;·&nbsp; {run_time}</p>
+
+  <h2>Summary</h2>
+  <div class="cards">{cards_html}</div>
+
+  <div class="legend">
+    <span>TTFT colour scale:</span>
+    <span><span class="legend-dot" style="background:#22c55e"></span>&lt; 1 s</span>
+    <span><span class="legend-dot" style="background:#eab308"></span>1 – 3 s</span>
+    <span><span class="legend-dot" style="background:#f97316"></span>3 – 8 s</span>
+    <span><span class="legend-dot" style="background:#ef4444"></span>&gt; 8 s</span>
+  </div>
+
+  <h2>Detail</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Prompt</th>
+          <th>TTFT</th>
+          <th>Total</th>
+          <th>In tok</th>
+          <th>Out tok</th>
+          <th>Cost (USD)</th>
+          <th>Response</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"""
+
+    with open(output_path, "w") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
 
@@ -443,6 +720,9 @@ async def main() -> None:
     with open("results.json", "w") as f:
         json.dump(output, f, indent=2)
     console.print("[dim]Full responses saved to results.json[/dim]")
+
+    generate_html_report(all_results, "results.html")
+    console.print("[dim]HTML report saved to results.html[/dim]")
 
 
 if __name__ == "__main__":

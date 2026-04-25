@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 *.pyo
 results.json
+results.html
 .env
