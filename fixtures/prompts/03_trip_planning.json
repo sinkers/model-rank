@@ -1,0 +1,6 @@
+{
+  "id": "plan",
+  "label": "Trip planning",
+  "system_prompt": "voice_agent",
+  "message": "Plan a 3-day weekend itinerary for two people visiting Tokyo for the first time with a $2,000 budget. Include accommodation, food, and key sights."
+}

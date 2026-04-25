@@ -1,0 +1,6 @@
+{
+  "id": "schedule",
+  "label": "Meeting invite",
+  "system_prompt": "voice_agent",
+  "message": "Draft a professional meeting invite for a 1-hour product strategy sync with 5 team members, scheduled for next Monday at 10 am. Include an agenda, a video-call link placeholder, and prep instructions."
+}

@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 import httpx
 from rich.console import Console
@@ -30,12 +31,34 @@ BASE_URL = "https://openrouter.ai/api/v1"
 
 # Voice agent constraints
 MAX_TOKENS = 350  # keep responses short enough to speak aloud
-SYSTEM_PROMPT = (
-    "You are a voice assistant. Reply conversationally as if speaking aloud. "
-    "Never use markdown, bullet points, headers, emojis, or any formatting. "
-    "Be brief and direct — a few sentences at most. "
-    "Write exactly as you would say it."
-)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def load_system_prompts() -> dict[str, str]:
+    """Load all .txt files from fixtures/system_prompts/ keyed by stem name."""
+    sp_dir = FIXTURES_DIR / "system_prompts"
+    return {p.stem: p.read_text().strip() for p in sorted(sp_dir.glob("*.txt"))}
+
+
+def load_prompts(system_prompts: dict[str, str]) -> list[dict]:
+    """
+    Load all .json files from fixtures/prompts/ sorted by filename.
+    Resolves the 'system_prompt' key to the full text from system_prompts.
+    Raises if a referenced system prompt name doesn't exist.
+    """
+    prompts = []
+    for path in sorted((FIXTURES_DIR / "prompts").glob("*.json")):
+        data = json.loads(path.read_text())
+        sp_name = data.get("system_prompt")
+        if sp_name:
+            if sp_name not in system_prompts:
+                sys.exit(f"Error: prompt '{path.name}' references unknown system_prompt '{sp_name}'.")
+            data["system_prompt_text"] = system_prompts[sp_name]
+        else:
+            data["system_prompt_text"] = None
+        prompts.append(data)
+    return prompts
 
 # Search terms used to resolve model IDs from the OpenRouter models API.
 # Each value is (search_term, provider_preferences).
@@ -61,50 +84,7 @@ MODEL_SEARCHES: dict[str, tuple[str, dict]] = {
     "GPT-OSS Safeguard (Groq)":    ("openai/gpt-oss-safeguard-20b",          {"order": ["Groq"],       "allow_fallbacks": False}),
 }
 
-# Personal assistant style prompts
-PROMPTS: list[dict] = [
-    {
-        "id": "schedule",
-        "label": "Meeting invite",
-        "message": (
-            "Draft a professional meeting invite for a 1-hour product strategy sync "
-            "with 5 team members, scheduled for next Monday at 10 am. Include an agenda, "
-            "a video-call link placeholder, and prep instructions."
-        ),
-    },
-    {
-        "id": "email",
-        "label": "Follow-up email",
-        "message": (
-            "Write a polite but firm follow-up email to a client who hasn't responded "
-            "to our $15,000 software development proposal in two weeks."
-        ),
-    },
-    {
-        "id": "plan",
-        "label": "Trip planning",
-        "message": (
-            "Plan a 3-day weekend itinerary for two people visiting Tokyo for the first time "
-            "with a $2,000 budget. Include accommodation, food, and key sights."
-        ),
-    },
-    {
-        "id": "recommend",
-        "label": "Book recs",
-        "message": (
-            "Recommend 5 books for someone who loved The Hitchhiker's Guide to the Galaxy. "
-            "Briefly explain why each one would appeal to them."
-        ),
-    },
-    {
-        "id": "tasks",
-        "label": "Task breakdown",
-        "message": (
-            "I need to launch a company blog from scratch in 6 weeks. "
-            "Break this into a prioritised task list with rough time estimates."
-        ),
-    },
-]
+# Prompts and system prompts are loaded from fixtures/ at startup (see main)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -219,12 +199,14 @@ async def run_prompt(
         prompt_label=prompt["label"],
     )
 
+    messages: list[dict] = []
+    if prompt.get("system_prompt_text"):
+        messages.append({"role": "system", "content": prompt["system_prompt_text"]})
+    messages.append({"role": "user", "content": prompt["message"]})
+
     payload: dict = {
         "model": model_id,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt["message"]},
-        ],
+        "messages": messages,
         "stream": True,
         "max_tokens": MAX_TOKENS,
         "usage": {"include": True},
@@ -667,6 +649,13 @@ def generate_html_report(results: list[Result], output_path: str = "results.html
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    system_prompts = load_system_prompts()
+    prompts = load_prompts(system_prompts)
+    console.print(
+        f"[dim]Loaded {len(prompts)} prompts · "
+        f"{len(system_prompts)} system prompt(s): {', '.join(system_prompts)}[/dim]"
+    )
+
     async with httpx.AsyncClient() as client:
         # Resolve model search terms → concrete IDs from the live models list
         console.print("[dim]Resolving model IDs from OpenRouter API…[/dim]")
@@ -674,8 +663,8 @@ async def main() -> None:
 
         console.print(Panel.fit(
             "[bold cyan]OpenRouter Personal Assistant Model Test Suite[/bold cyan]\n"
-            f"Models: {len(models)}  |  Prompts: {len(PROMPTS)}  |  "
-            f"Total requests: {len(models) * len(PROMPTS)}",
+            f"Models: {len(models)}  |  Prompts: {len(prompts)}  |  "
+            f"Total requests: {len(models) * len(prompts)}",
             border_style="cyan",
         ))
 
@@ -694,7 +683,7 @@ async def main() -> None:
 
             console.print(f"[bold yellow]━━ {model_name}[/bold yellow] [dim]({model_id})[/dim]")
 
-            for prompt in PROMPTS:
+            for prompt in prompts:
                 console.print(f"  [cyan]►[/cyan] {prompt['label']} …", end="")
 
                 result = await run_prompt(client, model_name, model_id, prompt, provider_prefs)

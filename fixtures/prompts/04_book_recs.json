@@ -1,0 +1,6 @@
+{
+  "id": "recommend",
+  "label": "Book recs",
+  "system_prompt": "voice_agent",
+  "message": "Recommend 5 books for someone who loved The Hitchhiker's Guide to the Galaxy. Briefly explain why each one would appeal to them."
+}

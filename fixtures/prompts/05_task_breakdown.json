@@ -1,0 +1,6 @@
+{
+  "id": "tasks",
+  "label": "Task breakdown",
+  "system_prompt": "voice_agent",
+  "message": "I need to launch a company blog from scratch in 6 weeks. Break this into a prioritised task list with rough time estimates."
+}

@@ -1,0 +1,6 @@
+{
+  "id": "email",
+  "label": "Follow-up email",
+  "system_prompt": "voice_agent",
+  "message": "Write a polite but firm follow-up email to a client who hasn't responded to our $15,000 software development proposal in two weeks."
+}
