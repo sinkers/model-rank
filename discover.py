@@ -14,7 +14,17 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 import httpx
+
+# Load .env if present
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        if _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip())
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not API_KEY:
