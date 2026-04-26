@@ -1,0 +1,15 @@
+[run]
+name        = "sonnet-tools-check"
+description = "Verify tool calls work on reference model"
+
+[settings]
+max_tokens = 350
+timeout_s  = 120
+prompt_ids = ["web_search", "weather"]
+
+[[models]]
+name     = "Claude Sonnet 4.6 (Anthropic) [reference]"
+id       = "anthropic/claude-sonnet-4.6"
+[models.provider]
+order            = ["Anthropic"]
+allow_fallbacks  = false
