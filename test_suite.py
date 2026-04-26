@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
 OpenRouter Model Test Suite
-Tests personal assistant style requests across multiple models,
-measuring response quality, latency, and cost.
+Tests LLMs via OpenRouter across configurable prompts, measuring TTFT,
+latency, token usage, cost, and tool-calling behaviour.
+
+Usage:
+  python test_suite.py                        # uses config/default.toml
+  python test_suite.py --config config/tool_capable.toml
 """
 
+import argparse
 import asyncio
 import json
 import os
+import shutil
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Optional
+
 import httpx
 from rich.console import Console
 from rich.table import Table
@@ -20,36 +30,68 @@ from rich.panel import Panel
 from rich import box
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants
 # ---------------------------------------------------------------------------
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not API_KEY:
     sys.exit("Error: OPENROUTER_API_KEY environment variable is not set.")
 
-BASE_URL = "https://openrouter.ai/api/v1"
-
-# Voice agent constraints
-MAX_TOKENS = 350  # keep responses short enough to speak aloud
-
+BASE_URL     = "https://openrouter.ai/api/v1"
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+RESULTS_DIR  = Path(__file__).parent / "results"
 
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type":  "application/json",
+    "HTTP-Referer":  "https://github.com/sinkers/model-rank",
+    "X-Title":       "ModelRank",
+}
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def models_from_config(cfg: dict) -> dict[str, tuple[str, dict]]:
+    """Return {display_name: (model_id_or_search, provider_prefs)}."""
+    out = {}
+    for m in cfg.get("models", []):
+        out[m["name"]] = (m["id"], dict(m.get("provider", {})))
+    return out
+
+# ---------------------------------------------------------------------------
+# Fixture loading
+# ---------------------------------------------------------------------------
 
 def load_system_prompts() -> dict[str, str]:
-    """Load all .txt files from fixtures/system_prompts/ keyed by stem name."""
     sp_dir = FIXTURES_DIR / "system_prompts"
     return {p.stem: p.read_text().strip() for p in sorted(sp_dir.glob("*.txt"))}
 
 
-def load_prompts(system_prompts: dict[str, str]) -> list[dict]:
-    """
-    Load all .json files from fixtures/prompts/ sorted by filename.
-    Resolves the 'system_prompt' key to the full text from system_prompts.
-    Raises if a referenced system prompt name doesn't exist.
-    """
+def load_tools() -> dict[str, dict]:
+    tools_dir = FIXTURES_DIR / "tools"
+    return {p.stem: json.loads(p.read_text()) for p in sorted(tools_dir.glob("*.json"))}
+
+
+def load_prompts(
+    system_prompts: dict[str, str],
+    tools: dict[str, dict],
+    prompt_ids: list[str] | None = None,
+) -> list[dict]:
     prompts = []
     for path in sorted((FIXTURES_DIR / "prompts").glob("*.json")):
         data = json.loads(path.read_text())
+
+        if prompt_ids and data["id"] not in prompt_ids:
+            continue
+
         sp_name = data.get("system_prompt")
         if sp_name:
             if sp_name not in system_prompts:
@@ -57,34 +99,42 @@ def load_prompts(system_prompts: dict[str, str]) -> list[dict]:
             data["system_prompt_text"] = system_prompts[sp_name]
         else:
             data["system_prompt_text"] = None
+
+        resolved_tools = []
+        for name in data.get("tools", []):
+            if name not in tools:
+                sys.exit(f"Error: prompt '{path.name}' references unknown tool '{name}'.")
+            resolved_tools.append(tools[name])
+        data["tool_definitions"] = resolved_tools
+
         prompts.append(data)
     return prompts
 
-# Search terms used to resolve model IDs from the OpenRouter models API.
-# Each value is (search_term, provider_preferences).
-#
-# Two modes:
-#   - Partial search term (e.g. "claude-haiku"): picks the shortest non-:free match
-#   - Exact model ID (contains "/"): used as-is; pair with {"order": [...]} to pin provider
-#
-# Provider prefs reference: https://openrouter.ai/docs/guides/routing/provider-selection
-#   {"sort": "latency"}                                  — auto-pick fastest provider
-#   {"order": ["Groq"], "allow_fallbacks": False}        — hard-pin a specific provider
-MODEL_SEARCHES: dict[str, tuple[str, dict]] = {
-    # Top 10 fastest endpoints from /api/v1/models benchmarks (p50 latency, April 2026)
-    "Phi-4 (DeepInfra)":           ("microsoft/phi-4",                       {"order": ["DeepInfra"],  "allow_fallbacks": False}),
-    "Trinity Mini (Clarifai)":     ("arcee-ai/trinity-mini",                 {"order": ["Clarifai"],   "allow_fallbacks": False}),
-    "Llama Guard 4 12B":           ("meta-llama/llama-guard-4-12b",          {"order": ["Together"],   "allow_fallbacks": False}),
-    "Llama 3.1 8B (Friendli)":     ("meta-llama/llama-3.1-8b-instruct",     {"order": ["Friendli"],   "allow_fallbacks": False}),
-    "Lunaris 8B (DeepInfra)":      ("sao10k/l3-lunaris-8b",                  {"order": ["DeepInfra"],  "allow_fallbacks": False}),
-    "Ministral 3B (Mistral)":      ("mistralai/ministral-3b-2512",           {"order": ["Mistral"],    "allow_fallbacks": False}),
-    "Llama 3.1 8B (Groq)":         ("meta-llama/llama-3.1-8b-instruct",     {"order": ["Groq"],       "allow_fallbacks": False}),
-    "GPT-OSS 20B (Groq)":          ("openai/gpt-oss-20b",                    {"order": ["Groq"],       "allow_fallbacks": False}),
-    "Command R7B (Cohere)":        ("cohere/command-r7b-12-2024",            {"order": ["Cohere"],     "allow_fallbacks": False}),
-    "GPT-OSS Safeguard (Groq)":    ("openai/gpt-oss-safeguard-20b",          {"order": ["Groq"],       "allow_fallbacks": False}),
-}
+# ---------------------------------------------------------------------------
+# Model resolution
+# ---------------------------------------------------------------------------
 
-# Prompts and system prompts are loaded from fixtures/ at startup (see main)
+async def resolve_models(
+    client: httpx.AsyncClient,
+    searches: dict[str, tuple[str, dict]],
+) -> dict[str, tuple[str, dict]]:
+    resp = await client.get(f"{BASE_URL}/models", headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    all_ids = [m["id"] for m in resp.json().get("data", [])]
+
+    resolved: dict[str, tuple[str, dict]] = {}
+    for display_name, (term, prefs) in searches.items():
+        if "/" in term:
+            resolved[display_name] = (term if term in all_ids else f"UNRESOLVED:{term}", prefs)
+            continue
+        matches = [mid for mid in all_ids if term.lower() in mid.lower() and ":free" not in mid]
+        if not matches:
+            matches = [mid for mid in all_ids if term.lower() in mid.lower()]
+        resolved[display_name] = (
+            min(matches, key=len) if matches else f"UNRESOLVED:{term}",
+            prefs,
+        )
+    return resolved
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -92,66 +142,23 @@ MODEL_SEARCHES: dict[str, tuple[str, dict]] = {
 
 @dataclass
 class Result:
-    model_name: str
-    model_id: str
-    prompt_id: str
-    prompt_label: str
+    model_name:    str
+    model_id:      str
+    prompt_id:     str
+    prompt_label:  str
     response_text: str = ""
-    ttft_s: Optional[float] = None       # time to first token
-    total_s: Optional[float] = None      # total wall-clock time
-    input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    cost_usd: Optional[float] = None
-    generation_id: Optional[str] = None
-    error: Optional[str] = None
+    ttft_s:        Optional[float] = None
+    total_s:       Optional[float] = None
+    input_tokens:  Optional[int]   = None
+    output_tokens: Optional[int]   = None
+    cost_usd:      Optional[float] = None
+    generation_id: Optional[str]   = None
+    tool_calls:    Optional[list[dict]] = None
+    error:         Optional[str]   = None
 
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
-
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json",
-    "HTTP-Referer": "https://github.com/sinkers/model-rank",
-    "X-Title": "ClawtalkModelTest",
-}
-
-
-async def resolve_models(
-    client: httpx.AsyncClient,
-    searches: dict[str, tuple[str, dict]],
-) -> dict[str, tuple[str, dict]]:
-    """
-    Fetch the OpenRouter models list and resolve each search term to a concrete model ID.
-    Picks the shortest matching ID that isn't a :free variant (those often have lower limits).
-    """
-    resp = await client.get(f"{BASE_URL}/models", headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    all_models: list[dict] = resp.json().get("data", [])
-    all_ids = [m["id"] for m in all_models]
-
-    resolved: dict[str, tuple[str, dict]] = {}
-    for display_name, (term, prefs) in searches.items():
-        # If term is already a full model ID (contains "/"), use it directly
-        if "/" in term:
-            if term in all_ids:
-                resolved[display_name] = (term, prefs)
-            else:
-                resolved[display_name] = (f"UNRESOLVED:{term}", prefs)
-            continue
-
-        # Otherwise treat as a search term — pick shortest non-:free match
-        matches = [mid for mid in all_ids if term.lower() in mid.lower() and ":free" not in mid]
-        if not matches:
-            matches = [mid for mid in all_ids if term.lower() in mid.lower()]
-        if not matches:
-            resolved[display_name] = (f"UNRESOLVED:{term}", prefs)
-        else:
-            best = min(matches, key=len)
-            resolved[display_name] = (best, prefs)
-
-    return resolved
-
 
 async def fetch_generation_cost(
     client: httpx.AsyncClient,
@@ -159,11 +166,6 @@ async def fetch_generation_cost(
     retries: int = 8,
     delay: float = 1.0,
 ) -> Optional[float]:
-    """
-    Poll the OpenRouter generation endpoint until cost data is available.
-    OpenRouter processes cost asynchronously so it may not be ready immediately.
-    """
-    # Generation cost is processed asynchronously — give it a moment before polling
     await asyncio.sleep(2.0)
     for attempt in range(retries):
         try:
@@ -185,18 +187,17 @@ async def fetch_generation_cost(
 
 
 async def run_prompt(
-    client: httpx.AsyncClient,
-    model_name: str,
-    model_id: str,
-    prompt: dict,
+    client:        httpx.AsyncClient,
+    model_name:    str,
+    model_id:      str,
+    prompt:        dict,
     provider_prefs: dict | None = None,
+    timeout_s:     int = 120,
+    max_tokens:    int = 350,
 ) -> Result:
-    """Stream a single chat completion and collect metrics."""
     result = Result(
-        model_name=model_name,
-        model_id=model_id,
-        prompt_id=prompt["id"],
-        prompt_label=prompt["label"],
+        model_name=model_name, model_id=model_id,
+        prompt_id=prompt["id"], prompt_label=prompt["label"],
     )
 
     messages: list[dict] = []
@@ -205,26 +206,27 @@ async def run_prompt(
     messages.append({"role": "user", "content": prompt["message"]})
 
     payload: dict = {
-        "model": model_id,
-        "messages": messages,
-        "stream": True,
-        "max_tokens": MAX_TOKENS,
-        "usage": {"include": True},
+        "model":      model_id,
+        "messages":   messages,
+        "stream":     True,
+        "max_tokens": max_tokens,
+        "usage":      {"include": True},
     }
     if provider_prefs:
         payload["provider"] = provider_prefs
+    if prompt.get("tool_definitions"):
+        payload["tools"]       = prompt["tool_definitions"]
+        payload["tool_choice"] = "auto"
 
-    chunks: list[str] = []
+    chunks:   list[str]       = []
+    tc_accum: dict[int, dict] = {}
     start = time.perf_counter()
     first_token_at: Optional[float] = None
 
     try:
         async with client.stream(
-            "POST",
-            f"{BASE_URL}/chat/completions",
-            headers=HEADERS,
-            json=payload,
-            timeout=120,
+            "POST", f"{BASE_URL}/chat/completions",
+            headers=HEADERS, json=payload, timeout=timeout_s,
         ) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
@@ -238,474 +240,435 @@ async def run_prompt(
                 data_str = line[len("data:"):].strip()
                 if data_str == "[DONE]":
                     break
-
                 try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
 
-                # The generation ID is on every chunk — capture it once
                 if result.generation_id is None and chunk.get("id"):
                     result.generation_id = chunk["id"]
 
-                # Usage arrives on the final chunk
                 usage = chunk.get("usage")
                 if usage:
-                    result.input_tokens = usage.get("prompt_tokens")
+                    result.input_tokens  = usage.get("prompt_tokens")
                     result.output_tokens = usage.get("completion_tokens")
                     if "total_cost" in usage:
                         result.cost_usd = usage["total_cost"]
 
                 choices = chunk.get("choices", [])
-                if choices:
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
-                        chunks.append(content)
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+
+                for tc in delta.get("tool_calls", []):
+                    idx = tc.get("index", 0)
+                    if idx not in tc_accum:
+                        tc_accum[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.get("id"):
+                        tc_accum[idx]["id"] = tc["id"]
+                    fn = tc.get("function", {})
+                    if fn.get("name"):
+                        tc_accum[idx]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        tc_accum[idx]["arguments"] += fn["arguments"]
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+
+                content = delta.get("content", "")
+                if content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    chunks.append(content)
 
     except httpx.TimeoutException:
-        result.error = "Request timed out after 120s"
+        result.error = f"Request timed out after {timeout_s}s"
         return result
     except Exception as exc:
         result.error = str(exc)
         return result
 
-    end = time.perf_counter()
-    result.total_s = end - start
-    result.ttft_s = (first_token_at - start) if first_token_at else None
-    result.response_text = "".join(chunks)
+    result.total_s        = time.perf_counter() - start
+    result.ttft_s         = (first_token_at - start) if first_token_at else None
+    result.response_text  = "".join(chunks)
 
-    # Poll for cost if it wasn't included inline in the usage chunk
+    if tc_accum:
+        result.tool_calls = []
+        for tc in tc_accum.values():
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"_raw": tc["arguments"]}
+            result.tool_calls.append({"name": tc["name"], "arguments": args})
+
     if result.cost_usd is None and result.generation_id:
         result.cost_usd = await fetch_generation_cost(client, result.generation_id)
 
     return result
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Terminal display
 # ---------------------------------------------------------------------------
 
-console = Console()
-
-
 def print_summary_table(results: list[Result]) -> None:
-    table = Table(
-        title="Model Comparison Summary",
-        box=box.ROUNDED,
-        show_lines=True,
-        header_style="bold cyan",
-    )
-    table.add_column("Model", style="bold", min_width=14)
-    table.add_column("Prompt", min_width=16)
-    table.add_column("TTFT", justify="right")
-    table.add_column("Total", justify="right")
-    table.add_column("In tok", justify="right")
-    table.add_column("Out tok", justify="right")
+    table = Table(title="Model Comparison", box=box.ROUNDED, show_lines=True, header_style="bold cyan")
+    table.add_column("Model",      style="bold", min_width=14)
+    table.add_column("Prompt",     min_width=16)
+    table.add_column("TTFT",       justify="right")
+    table.add_column("Total",      justify="right")
+    table.add_column("In tok",     justify="right")
+    table.add_column("Out tok",    justify="right")
     table.add_column("Cost (USD)", justify="right")
+    table.add_column("Tool calls")
     table.add_column("Status")
 
     for r in results:
+        tc = ", ".join(t["name"] for t in r.tool_calls) if r.tool_calls else ""
         if r.error:
-            table.add_row(
-                r.model_name, r.prompt_label,
-                "—", "—", "—", "—", "—",
-                f"[red]{r.error[:40]}[/red]",
-            )
+            table.add_row(r.model_name, r.prompt_label, "—","—","—","—","—","—",
+                          f"[red]{r.error[:40]}[/red]")
         else:
-            ttft  = f"{r.ttft_s:.2f}s"    if r.ttft_s  is not None else "—"
-            total = f"{r.total_s:.2f}s"   if r.total_s is not None else "—"
-            tin   = str(r.input_tokens)   if r.input_tokens  is not None else "—"
-            tout  = str(r.output_tokens)  if r.output_tokens is not None else "—"
-            cost  = f"${r.cost_usd:.6f}"  if r.cost_usd is not None else "—"
             table.add_row(
                 r.model_name, r.prompt_label,
-                ttft, total, tin, tout, cost,
+                f"{r.ttft_s:.2f}s"   if r.ttft_s        is not None else "—",
+                f"{r.total_s:.2f}s"  if r.total_s       is not None else "—",
+                str(r.input_tokens)  if r.input_tokens  is not None else "—",
+                str(r.output_tokens) if r.output_tokens is not None else "—",
+                f"${r.cost_usd:.6f}" if r.cost_usd      is not None else "—",
+                f"[magenta]{tc}[/magenta]" if tc else "—",
                 "[green]OK[/green]",
             )
-
     console.print(table)
 
 
-def print_per_model_averages(results: list[Result]) -> None:
+def print_leaderboard(results: list[Result]) -> None:
     from collections import defaultdict
-
     groups: dict[str, list[Result]] = defaultdict(list)
     for r in results:
         if not r.error:
             groups[r.model_name].append(r)
 
-    table = Table(
-        title="Per-Model Averages",
-        box=box.ROUNDED,
-        header_style="bold magenta",
-    )
-    table.add_column("Model", style="bold")
-    table.add_column("Model ID", style="dim")
-    table.add_column("Avg TTFT", justify="right")
-    table.add_column("Avg Total", justify="right")
-    table.add_column("Avg Out tok", justify="right")
+    def avg(vals): return sum(vals) / len(vals) if vals else None
+
+    rows = []
+    for name, res in groups.items():
+        ttfts  = [r.ttft_s    for r in res if r.ttft_s    is not None]
+        totals = [r.total_s   for r in res if r.total_s   is not None]
+        costs  = [r.cost_usd  for r in res if r.cost_usd  is not None]
+        tool_ok = sum(1 for r in res if r.tool_calls)
+        rows.append({
+            "name":       name,
+            "model_id":   res[0].model_id,
+            "avg_ttft":   avg(ttfts),
+            "avg_total":  avg(totals),
+            "total_cost": sum(costs) if costs else None,
+            "ok":         len(res),
+            "tool_ok":    tool_ok,
+        })
+
+    rows.sort(key=lambda r: (r["avg_ttft"] or 9999))
+
+    table = Table(title="Leaderboard", box=box.ROUNDED, header_style="bold magenta")
+    table.add_column("Rank", justify="right")
+    table.add_column("Model",      style="bold")
+    table.add_column("Avg TTFT",   justify="right")
+    table.add_column("Avg Total",  justify="right")
     table.add_column("Total Cost", justify="right")
-    table.add_column("OK", justify="right")
+    table.add_column("Tool calls", justify="right")
+    table.add_column("Prompts OK", justify="right")
 
-    for model_name, res in sorted(groups.items()):
-        ttfts    = [r.ttft_s        for r in res if r.ttft_s        is not None]
-        totals   = [r.total_s       for r in res if r.total_s       is not None]
-        out_toks = [r.output_tokens for r in res if r.output_tokens is not None]
-        costs    = [r.cost_usd      for r in res if r.cost_usd      is not None]
-
+    medals = {1: "1st", 2: "2nd", 3: "3rd"}
+    for i, r in enumerate(rows, 1):
         table.add_row(
-            model_name,
-            res[0].model_id,
-            f"{sum(ttfts)/len(ttfts):.2f}s"          if ttfts    else "—",
-            f"{sum(totals)/len(totals):.2f}s"         if totals   else "—",
-            f"{sum(out_toks)/len(out_toks):.0f}"      if out_toks else "—",
-            f"${sum(costs):.6f}"                      if costs    else "—",
-            str(len(res)),
+            medals.get(i, str(i)),
+            r["name"],
+            f"{r['avg_ttft']:.2f}s"    if r["avg_ttft"]   is not None else "—",
+            f"{r['avg_total']:.2f}s"   if r["avg_total"]  is not None else "—",
+            f"${r['total_cost']:.6f}"  if r["total_cost"] is not None else "—",
+            str(r["tool_ok"]) if r["tool_ok"] else "—",
+            str(r["ok"]),
         )
-
     console.print(table)
 
 # ---------------------------------------------------------------------------
 # HTML report
 # ---------------------------------------------------------------------------
 
-def _ttft_color(ttft_s: Optional[float]) -> str:
-    if ttft_s is None:
-        return "#888"
-    if ttft_s < 1.0:
-        return "#22c55e"   # green
-    if ttft_s < 3.0:
-        return "#eab308"   # yellow
-    if ttft_s < 8.0:
-        return "#f97316"   # orange
-    return "#ef4444"       # red
+def _ttft_color(v: Optional[float]) -> str:
+    if v is None:   return "#888"
+    if v < 1.0:     return "#22c55e"
+    if v < 3.0:     return "#eab308"
+    if v < 8.0:     return "#f97316"
+    return "#ef4444"
 
 
-def generate_html_report(results: list[Result], output_path: str = "results.html") -> None:
+def generate_html_report(
+    results: list[Result],
+    run_cfg: dict,
+    output_path: Path,
+) -> None:
     from collections import defaultdict
-    from datetime import datetime, timezone
-    from html import escape
 
-    run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    run_name  = run_cfg.get("run", {}).get("name", "run")
+    run_desc  = run_cfg.get("run", {}).get("description", "")
+    run_time  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # --- per-model aggregates ---
+    # --- aggregates ---
     groups: dict[str, list[Result]] = defaultdict(list)
     for r in results:
         if not r.error:
             groups[r.model_name].append(r)
 
-    def avg(vals: list[float]) -> Optional[float]:
-        return sum(vals) / len(vals) if vals else None
+    def avg(vals): return sum(vals) / len(vals) if vals else None
 
-    # -----------------------------------------------------------------------
-    # Summary cards
-    # -----------------------------------------------------------------------
-    cards_html = ""
-    # rank by avg TTFT (models with no TTFT go last)
-    def sort_key(item: tuple) -> float:
-        _, res = item
-        ttfts = [r.ttft_s for r in res if r.ttft_s is not None]
-        return avg(ttfts) if ttfts else 9999
+    board_rows = []
+    for name, res in groups.items():
+        ttfts  = [r.ttft_s   for r in res if r.ttft_s   is not None]
+        totals = [r.total_s  for r in res if r.total_s  is not None]
+        costs  = [r.cost_usd for r in res if r.cost_usd is not None]
+        out_t  = [r.output_tokens for r in res if r.output_tokens is not None]
+        tool_ok = sum(1 for r in res if r.tool_calls)
+        board_rows.append({
+            "name":       name,
+            "model_id":   res[0].model_id,
+            "avg_ttft":   avg(ttfts),
+            "avg_total":  avg(totals),
+            "avg_out":    avg(out_t),
+            "total_cost": sum(costs) if costs else None,
+            "ok":         len(res),
+            "tool_ok":    tool_ok,
+            "errors":     sum(1 for r in results if r.model_name == name and r.error),
+        })
+    board_rows.sort(key=lambda r: (r["avg_ttft"] or 9999))
 
-    for model_name, res in sorted(groups.items(), key=sort_key):
-        mid        = res[0].model_id
-        ttfts      = [r.ttft_s        for r in res if r.ttft_s        is not None]
-        totals     = [r.total_s       for r in res if r.total_s       is not None]
-        out_toks   = [r.output_tokens for r in res if r.output_tokens is not None]
-        costs      = [r.cost_usd      for r in res if r.cost_usd      is not None]
+    # --- leaderboard HTML ---
+    medals = ["1st", "2nd", "3rd"]
+    leaderboard_html = ""
+    for i, r in enumerate(board_rows):
+        color   = _ttft_color(r["avg_ttft"])
+        badge   = medals[i] if i < 3 else str(i + 1)
+        ttft_s  = f"{r['avg_ttft']:.2f}s"   if r["avg_ttft"]   is not None else "—"
+        tot_s   = f"{r['avg_total']:.2f}s"  if r["avg_total"]  is not None else "—"
+        cost_s  = f"${r['total_cost']:.6f}" if r["total_cost"] is not None else "—"
+        tools_s = f"{r['tool_ok']} / {r['ok']}" if r["tool_ok"] else "—"
+        tool_cls = "tool-yes" if r["tool_ok"] else "tool-no"
 
-        avg_ttft   = avg(ttfts)
-        avg_total  = avg(totals)
-        avg_out    = avg(out_toks)
-        total_cost = sum(costs) if costs else None
-
-        ttft_str  = f"{avg_ttft:.2f}s"        if avg_ttft   is not None else "—"
-        total_str = f"{avg_total:.2f}s"        if avg_total  is not None else "—"
-        out_str   = f"{avg_out:.0f}"           if avg_out    is not None else "—"
-        cost_str  = f"${total_cost:.6f}"       if total_cost is not None else "—"
-        color     = _ttft_color(avg_ttft)
-
-        cards_html += f"""
-        <div class="card">
-          <div class="card-name">{escape(model_name)}</div>
-          <div class="card-id">{escape(mid)}</div>
-          <div class="card-metrics">
-            <div class="metric">
-              <span class="metric-value" style="color:{color}">{ttft_str}</span>
-              <span class="metric-label">avg TTFT</span>
-            </div>
-            <div class="metric">
-              <span class="metric-value">{total_str}</span>
-              <span class="metric-label">avg total</span>
-            </div>
-            <div class="metric">
-              <span class="metric-value">{out_str}</span>
-              <span class="metric-label">avg tokens</span>
-            </div>
-            <div class="metric">
-              <span class="metric-value">{cost_str}</span>
-              <span class="metric-label">total cost</span>
-            </div>
+        leaderboard_html += f"""
+      <div class="lb-card rank-{min(i+1,4)}">
+        <div class="lb-rank">{badge}</div>
+        <div class="lb-body">
+          <div class="lb-name">{escape(r['name'])}</div>
+          <div class="lb-id">{escape(r['model_id'])}</div>
+          <div class="lb-stats">
+            <span class="stat"><span class="stat-val" style="color:{color}">{ttft_s}</span><span class="stat-lbl">TTFT</span></span>
+            <span class="stat"><span class="stat-val">{tot_s}</span><span class="stat-lbl">total</span></span>
+            <span class="stat"><span class="stat-val">{cost_s}</span><span class="stat-lbl">cost</span></span>
+            <span class="stat {tool_cls}"><span class="stat-val">{tools_s}</span><span class="stat-lbl">tool calls</span></span>
           </div>
-          <div class="card-ok">{len(res)}/{len(res) + sum(1 for r in results if r.model_name == model_name and r.error)} prompts OK</div>
-        </div>"""
+        </div>
+      </div>"""
 
-    # -----------------------------------------------------------------------
-    # Detail rows
-    # -----------------------------------------------------------------------
-    rows_html = ""
-    prev_model = None
+    # --- detail rows ---
+    detail_rows = ""
     for r in results:
-        model_class = "model-first" if r.model_name != prev_model else ""
-        prev_model = r.model_name
+        tc = ""
+        if r.tool_calls:
+            for tc_item in r.tool_calls:
+                args_str = escape(json.dumps(tc_item["arguments"], indent=2))
+                tc += f'<span class="tool-name">{escape(tc_item["name"])}</span><pre class="tool-args">{args_str}</pre>'
+        color   = _ttft_color(r.ttft_s)
+        ttft_s  = f"{r.ttft_s:.2f}"   if r.ttft_s        is not None else "—"
+        tot_s   = f"{r.total_s:.2f}"  if r.total_s       is not None else "—"
+        tin_s   = str(r.input_tokens) if r.input_tokens  is not None else "—"
+        tout_s  = str(r.output_tokens)if r.output_tokens is not None else "—"
+        cost_s  = f"{r.cost_usd:.6f}" if r.cost_usd      is not None else "—"
+        status  = f'<span class="badge-err">ERROR</span>' if r.error else '<span class="badge-ok">OK</span>'
+        err_td  = f'<td colspan="6" class="err-msg">{escape(r.error or "")}</td>' if r.error else \
+                  f'<td data-val="{ttft_s}"  style="color:{color};font-weight:600">{ttft_s}s</td>' \
+                  f'<td data-val="{tot_s}">{tot_s}s</td>' \
+                  f'<td data-val="{tin_s}">{tin_s}</td>' \
+                  f'<td data-val="{tout_s}">{tout_s}</td>' \
+                  f'<td data-val="{cost_s}">{cost_s}</td>' \
+                  f'<td>{tc or "—"}</td>'
 
-        if r.error:
-            rows_html += f"""
-        <tr class="error-row {model_class}">
-          <td>{escape(r.model_name)}</td>
-          <td>{escape(r.prompt_label)}</td>
-          <td colspan="5" class="error-msg">{escape(r.error[:120])}</td>
-          <td><span class="badge badge-error">ERROR</span></td>
-        </tr>"""
-        else:
-            color    = _ttft_color(r.ttft_s)
-            ttft_str = f"{r.ttft_s:.2f}s"   if r.ttft_s        is not None else "—"
-            tot_str  = f"{r.total_s:.2f}s"  if r.total_s       is not None else "—"
-            tin_str  = str(r.input_tokens)  if r.input_tokens  is not None else "—"
-            tout_str = str(r.output_tokens) if r.output_tokens is not None else "—"
-            cost_str = f"${r.cost_usd:.6f}" if r.cost_usd      is not None else "—"
-            preview  = escape(r.response_text[:120]).replace("\n", " ")
-            if len(r.response_text) > 120:
-                preview += "…"
-            full_text = escape(r.response_text)
+        preview  = escape(r.response_text[:120]).replace("\n", " ")
+        if len(r.response_text) > 120:
+            preview += "…"
+        full_text = escape(r.response_text)
 
-            rows_html += f"""
-        <tr class="{model_class}">
-          <td><strong>{escape(r.model_name)}</strong></td>
-          <td>{escape(r.prompt_label)}</td>
-          <td style="color:{color};font-weight:600">{ttft_str}</td>
-          <td>{tot_str}</td>
-          <td>{tin_str}</td>
-          <td>{tout_str}</td>
-          <td>{cost_str}</td>
-          <td>
-            <details>
-              <summary class="response-preview">{preview}</summary>
-              <div class="response-full">{full_text}</div>
-            </details>
-          </td>
-        </tr>"""
+        detail_rows += f"""
+      <tr>
+        <td>{escape(r.model_name)}</td>
+        <td>{escape(r.prompt_label)}</td>
+        {err_td}
+        <td>
+          <details><summary class="resp-preview">{preview or "<em>no text</em>"}</summary>
+          <div class="resp-full">{full_text}</div></details>
+        </td>
+        <td>{status}</td>
+      </tr>"""
 
-    # -----------------------------------------------------------------------
-    # Full HTML
-    # -----------------------------------------------------------------------
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Model Rank — Results</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Model Rank — {escape(run_name)}</title>
   <style>
-    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+          background:#0f1117;color:#e2e8f0;padding:2rem;line-height:1.5}}
+    h1{{font-size:1.5rem;font-weight:700;color:#f8fafc}}
+    h2{{font-size:.9rem;font-weight:600;color:#64748b;text-transform:uppercase;
+        letter-spacing:.08em;margin:2rem 0 .8rem}}
+    .meta{{color:#64748b;font-size:.82rem;margin-top:.25rem}}
 
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f1117;
-      color: #e2e8f0;
-      padding: 2rem;
-      line-height: 1.5;
-    }}
+    /* leaderboard */
+    .leaderboard{{display:flex;flex-wrap:wrap;gap:.75rem;margin-top:.5rem}}
+    .lb-card{{display:flex;gap:1rem;background:#1e2330;border:1px solid #2d3448;
+              border-radius:.75rem;padding:1rem 1.2rem;flex:1 1 260px;align-items:flex-start}}
+    .rank-1{{border-color:#f59e0b}}
+    .rank-2{{border-color:#94a3b8}}
+    .rank-3{{border-color:#b45309}}
+    .lb-rank{{font-size:1.3rem;font-weight:800;color:#64748b;min-width:2.5rem;padding-top:.1rem}}
+    .rank-1 .lb-rank{{color:#f59e0b}}
+    .rank-2 .lb-rank{{color:#94a3b8}}
+    .rank-3 .lb-rank{{color:#b45309}}
+    .lb-name{{font-size:.95rem;font-weight:700;color:#f1f5f9}}
+    .lb-id{{font-size:.7rem;color:#475569;font-family:monospace;margin:.15rem 0 .6rem}}
+    .lb-stats{{display:flex;flex-wrap:wrap;gap:.8rem}}
+    .stat{{display:flex;flex-direction:column;align-items:center}}
+    .stat-val{{font-size:1rem;font-weight:700}}
+    .stat-lbl{{font-size:.65rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em}}
+    .tool-yes .stat-val{{color:#22c55e}}
+    .tool-no  .stat-val{{color:#475569}}
 
-    h1 {{ font-size: 1.6rem; font-weight: 700; color: #f8fafc; }}
-    h2 {{ font-size: 1.1rem; font-weight: 600; color: #94a3b8; text-transform: uppercase;
-          letter-spacing: .08em; margin: 2rem 0 1rem; }}
+    /* table */
+    .tbl-wrap{{overflow-x:auto;margin-top:.5rem}}
+    table{{width:100%;border-collapse:collapse;font-size:.83rem}}
+    thead th{{background:#1e2330;color:#94a3b8;text-transform:uppercase;font-size:.7rem;
+              letter-spacing:.07em;padding:.6rem .9rem;text-align:left;
+              border-bottom:1px solid #2d3448;white-space:nowrap;user-select:none}}
+    thead th.sortable{{cursor:pointer}}
+    thead th.sortable:hover{{color:#e2e8f0}}
+    thead th.sort-asc::after{{content:" ▲";font-size:.65rem}}
+    thead th.sort-desc::after{{content:" ▼";font-size:.65rem}}
+    tbody tr{{border-bottom:1px solid #161b27}}
+    tbody tr:hover{{background:#1a1f2e}}
+    td{{padding:.5rem .9rem;vertical-align:top}}
+    .err-msg{{font-family:monospace;font-size:.78rem;color:#f87171}}
+    .badge-ok{{background:#14532d;color:#86efac;font-size:.7rem;
+               font-weight:600;padding:.15rem .45rem;border-radius:.25rem}}
+    .badge-err{{background:#450a0a;color:#fca5a5;font-size:.7rem;
+                font-weight:600;padding:.15rem .45rem;border-radius:.25rem}}
+    .tool-name{{background:#2d1b69;color:#c4b5fd;font-size:.7rem;font-weight:600;
+                padding:.1rem .4rem;border-radius:.25rem;font-family:monospace;display:inline-block}}
+    .tool-args{{font-size:.72rem;color:#94a3b8;background:#0f1117;border:1px solid #2d3448;
+                border-radius:.3rem;padding:.3rem .5rem;margin-top:.25rem;
+                white-space:pre-wrap;max-width:280px}}
+    details summary{{cursor:pointer;list-style:none;color:#64748b;font-size:.78rem}}
+    details summary::-webkit-details-marker{{display:none}}
+    details[open] summary{{color:#94a3b8;margin-bottom:.4rem}}
+    .resp-preview{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                   max-width:300px;display:block}}
+    .resp-full{{white-space:pre-wrap;font-size:.8rem;color:#cbd5e1;background:#0f1117;
+                border:1px solid #2d3448;border-radius:.4rem;padding:.65rem .9rem;max-width:560px}}
 
-    .meta {{ color: #64748b; font-size: .85rem; margin-top: .3rem; }}
-
-    /* --- cards --- */
-    .cards {{ display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }}
-    .card {{
-      background: #1e2330;
-      border: 1px solid #2d3448;
-      border-radius: .75rem;
-      padding: 1.2rem 1.4rem;
-      min-width: 200px;
-      flex: 1 1 200px;
-    }}
-    .card-name {{ font-size: 1rem; font-weight: 700; color: #f1f5f9; }}
-    .card-id   {{ font-size: .72rem; color: #64748b; margin-top: .15rem; margin-bottom: .8rem;
-                  font-family: monospace; }}
-    .card-metrics {{ display: flex; gap: 1.2rem; flex-wrap: wrap; }}
-    .metric {{ display: flex; flex-direction: column; align-items: center; }}
-    .metric-value {{ font-size: 1.2rem; font-weight: 700; }}
-    .metric-label {{ font-size: .7rem; color: #64748b; text-transform: uppercase;
-                     letter-spacing: .06em; margin-top: .1rem; }}
-    .card-ok {{ font-size: .75rem; color: #475569; margin-top: .8rem; }}
-
-    /* --- table --- */
-    .table-wrap {{ overflow-x: auto; margin-top: 1rem; }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: .85rem;
-    }}
-    thead th {{
-      background: #1e2330;
-      color: #94a3b8;
-      text-transform: uppercase;
-      font-size: .72rem;
-      letter-spacing: .07em;
-      padding: .65rem 1rem;
-      text-align: left;
-      border-bottom: 1px solid #2d3448;
-      white-space: nowrap;
-    }}
-    tbody tr {{ border-bottom: 1px solid #1e2330; }}
-    tbody tr:hover {{ background: #1a1f2e; }}
-    tbody tr.model-first {{ border-top: 2px solid #2d3448; }}
-    td {{ padding: .55rem 1rem; vertical-align: top; }}
-    .error-row td {{ color: #f87171; }}
-    .error-msg {{ font-family: monospace; font-size: .8rem; }}
-
-    /* --- badges --- */
-    .badge {{ display: inline-block; padding: .2rem .5rem; border-radius: .3rem;
-               font-size: .72rem; font-weight: 600; }}
-    .badge-error {{ background: #450a0a; color: #fca5a5; }}
-
-    /* --- response expand --- */
-    details summary {{
-      cursor: pointer;
-      list-style: none;
-      color: #64748b;
-      font-size: .8rem;
-    }}
-    details summary::-webkit-details-marker {{ display: none; }}
-    details[open] summary {{ color: #94a3b8; margin-bottom: .5rem; }}
-    .response-preview {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                         max-width: 320px; display: block; }}
-    .response-full {{
-      white-space: pre-wrap;
-      font-size: .82rem;
-      color: #cbd5e1;
-      background: #0f1117;
-      border: 1px solid #2d3448;
-      border-radius: .4rem;
-      padding: .75rem 1rem;
-      max-width: 600px;
-    }}
-
-    /* --- legend --- */
-    .legend {{ display: flex; gap: 1.5rem; font-size: .78rem; color: #64748b;
-               margin-top: .5rem; flex-wrap: wrap; }}
-    .legend-dot {{ width: 10px; height: 10px; border-radius: 50%;
-                   display: inline-block; margin-right: .3rem; }}
+    /* legend */
+    .legend{{display:flex;gap:1.2rem;font-size:.75rem;color:#64748b;margin-top:.5rem;flex-wrap:wrap}}
+    .dot{{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:.25rem}}
   </style>
 </head>
 <body>
-  <h1>Model Rank</h1>
-  <p class="meta">Personal assistant benchmark via OpenRouter &nbsp;·&nbsp; {run_time}</p>
+  <h1>Model Rank — {escape(run_name)}</h1>
+  <p class="meta">{escape(run_desc)} &nbsp;·&nbsp; {run_time}</p>
 
-  <h2>Summary</h2>
-  <div class="cards">{cards_html}</div>
+  <h2>Leaderboard</h2>
+  <div class="leaderboard">{leaderboard_html}</div>
 
   <div class="legend">
-    <span>TTFT colour scale:</span>
-    <span><span class="legend-dot" style="background:#22c55e"></span>&lt; 1 s</span>
-    <span><span class="legend-dot" style="background:#eab308"></span>1 – 3 s</span>
-    <span><span class="legend-dot" style="background:#f97316"></span>3 – 8 s</span>
-    <span><span class="legend-dot" style="background:#ef4444"></span>&gt; 8 s</span>
+    <span>TTFT:</span>
+    <span><span class="dot" style="background:#22c55e"></span>&lt; 1s</span>
+    <span><span class="dot" style="background:#eab308"></span>1–3s</span>
+    <span><span class="dot" style="background:#f97316"></span>3–8s</span>
+    <span><span class="dot" style="background:#ef4444"></span>&gt; 8s</span>
   </div>
 
-  <h2>Detail</h2>
-  <div class="table-wrap">
-    <table>
+  <h2>Detail <span style="font-weight:400;color:#475569;font-size:.8rem">(click column headers to sort)</span></h2>
+  <div class="tbl-wrap">
+    <table id="detail">
       <thead>
         <tr>
-          <th>Model</th>
-          <th>Prompt</th>
-          <th>TTFT</th>
-          <th>Total</th>
-          <th>In tok</th>
-          <th>Out tok</th>
-          <th>Cost (USD)</th>
+          <th class="sortable" data-col="0">Model</th>
+          <th class="sortable" data-col="1">Prompt</th>
+          <th class="sortable" data-col="2">TTFT (s)</th>
+          <th class="sortable" data-col="3">Total (s)</th>
+          <th class="sortable" data-col="4">In tok</th>
+          <th class="sortable" data-col="5">Out tok</th>
+          <th class="sortable" data-col="6">Cost (USD)</th>
+          <th>Tool calls</th>
           <th>Response</th>
+          <th>Status</th>
         </tr>
       </thead>
-      <tbody>{rows_html}
-      </tbody>
+      <tbody>{detail_rows}</tbody>
     </table>
   </div>
+
+  <script>
+  (function(){{
+    const table = document.getElementById('detail');
+    const tbody = table.querySelector('tbody');
+    let sortCol = -1, sortDir = 1;
+
+    table.querySelectorAll('th.sortable').forEach(th => {{
+      th.addEventListener('click', () => {{
+        const col = +th.dataset.col;
+        if (sortCol === col) {{ sortDir *= -1; }}
+        else {{ sortCol = col; sortDir = 1; }}
+
+        table.querySelectorAll('th').forEach(h => h.classList.remove('sort-asc','sort-desc'));
+        th.classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort((a, b) => {{
+          const getVal = row => {{
+            const cells = row.querySelectorAll('td');
+            const cell  = cells[col];
+            if (!cell) return '';
+            return cell.dataset.val ?? cell.textContent.trim();
+          }};
+          const va = getVal(a), vb = getVal(b);
+          const na = parseFloat(va), nb = parseFloat(vb);
+          if (!isNaN(na) && !isNaN(nb)) return (na - nb) * sortDir;
+          return va.localeCompare(vb) * sortDir;
+        }});
+        rows.forEach(r => tbody.appendChild(r));
+      }});
+    }});
+  }})();
+  </script>
 </body>
 </html>"""
 
-    with open(output_path, "w") as f:
-        f.write(html)
-
+    output_path.write_text(html)
 
 # ---------------------------------------------------------------------------
-# Main runner
+# Results persistence
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
-    system_prompts = load_system_prompts()
-    prompts = load_prompts(system_prompts)
-    console.print(
-        f"[dim]Loaded {len(prompts)} prompts · "
-        f"{len(system_prompts)} system prompt(s): {', '.join(system_prompts)}[/dim]"
-    )
+def make_results_dir(run_name: str) -> Path:
+    ts  = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    slug = run_name.lower().replace(" ", "-")
+    d   = RESULTS_DIR / f"{ts}_{slug}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-    async with httpx.AsyncClient() as client:
-        # Resolve model search terms → concrete IDs from the live models list
-        console.print("[dim]Resolving model IDs from OpenRouter API…[/dim]")
-        models = await resolve_models(client, MODEL_SEARCHES)
 
-        console.print(Panel.fit(
-            "[bold cyan]OpenRouter Personal Assistant Model Test Suite[/bold cyan]\n"
-            f"Models: {len(models)}  |  Prompts: {len(prompts)}  |  "
-            f"Total requests: {len(models) * len(prompts)}",
-            border_style="cyan",
-        ))
+def save_results(results: list[Result], results_dir: Path, config_path: Path, run_cfg: dict) -> None:
+    # Copy the config used for this run
+    shutil.copy(config_path, results_dir / "config.toml")
 
-        # Show resolved IDs
-        for display, (mid, _) in models.items():
-            flag = "[red]UNRESOLVED[/red]" if mid.startswith("UNRESOLVED") else "[green]✓[/green]"
-            console.print(f"  {flag} {display}: [dim]{mid}[/dim]")
-        console.print()
-
-        all_results: list[Result] = []
-
-        for model_name, (model_id, provider_prefs) in models.items():
-            if model_id.startswith("UNRESOLVED"):
-                console.print(f"[red]Skipping {model_name} — no matching model ID found[/red]")
-                continue
-
-            console.print(f"[bold yellow]━━ {model_name}[/bold yellow] [dim]({model_id})[/dim]")
-
-            for prompt in prompts:
-                console.print(f"  [cyan]►[/cyan] {prompt['label']} …", end="")
-
-                result = await run_prompt(client, model_name, model_id, prompt, provider_prefs)
-                all_results.append(result)
-
-                if result.error:
-                    console.print(f" [red]FAILED[/red]")
-                    console.print(f"    [red]{result.error[:120]}[/red]")
-                else:
-                    ttft  = f"{result.ttft_s:.2f}s"       if result.ttft_s  else "—"
-                    total = f"{result.total_s:.2f}s"      if result.total_s else "—"
-                    cost  = f"${result.cost_usd:.6f}"     if result.cost_usd is not None else "n/a"
-                    console.print(
-                        f" [green]done[/green] "
-                        f"[dim]ttft={ttft} total={total} cost={cost}[/dim]"
-                    )
-
-    console.print()
-    print_summary_table(all_results)
-    console.print()
-    print_per_model_averages(all_results)
-
+    # JSON results
     output = [
         {
             "model_name":    r.model_name,
@@ -718,17 +681,107 @@ async def main() -> None:
             "input_tokens":  r.input_tokens,
             "output_tokens": r.output_tokens,
             "cost_usd":      r.cost_usd,
+            "tool_calls":    r.tool_calls,
             "error":         r.error,
         }
-        for r in all_results
+        for r in results
     ]
-    with open("results.json", "w") as f:
-        json.dump(output, f, indent=2)
-    console.print("[dim]Full responses saved to results.json[/dim]")
+    (results_dir / "results.json").write_text(json.dumps(output, indent=2))
 
-    generate_html_report(all_results, "results.html")
-    console.print("[dim]HTML report saved to results.html[/dim]")
+    # HTML report
+    generate_html_report(results, run_cfg, results_dir / "report.html")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main(config_path: Path) -> None:
+    cfg        = load_config(config_path)
+    run_name   = cfg.get("run", {}).get("name", "run")
+    settings   = cfg.get("settings", {})
+    max_tokens = settings.get("max_tokens", 350)
+    timeout_s  = settings.get("timeout_s", 120)
+    prompt_ids = settings.get("prompt_ids")
+
+    system_prompts = load_system_prompts()
+    tools          = load_tools()
+    prompts        = load_prompts(system_prompts, tools, prompt_ids)
+    model_searches = models_from_config(cfg)
+
+    console.print(
+        f"[dim]Config: {config_path.name} · "
+        f"{len(prompts)} prompts · "
+        f"{len(system_prompts)} system prompt(s) · "
+        f"{len(tools)} tool(s)[/dim]"
+    )
+
+    async with httpx.AsyncClient() as client:
+        console.print("[dim]Resolving model IDs…[/dim]")
+        models = await resolve_models(client, model_searches)
+
+        console.print(Panel.fit(
+            f"[bold cyan]Model Rank — {run_name}[/bold cyan]\n"
+            f"Models: {len(models)}  |  Prompts: {len(prompts)}  |  "
+            f"Total requests: {len(models) * len(prompts)}",
+            border_style="cyan",
+        ))
+
+        for display, (mid, _) in models.items():
+            flag = "[red]UNRESOLVED[/red]" if mid.startswith("UNRESOLVED") else "[green]✓[/green]"
+            console.print(f"  {flag} {display}: [dim]{mid}[/dim]")
+        console.print()
+
+        all_results: list[Result] = []
+
+        for model_name, (model_id, provider_prefs) in models.items():
+            if model_id.startswith("UNRESOLVED"):
+                console.print(f"[red]Skipping {model_name} — no matching model found[/red]")
+                continue
+            console.print(f"[bold yellow]━━ {model_name}[/bold yellow] [dim]({model_id})[/dim]")
+
+            for prompt in prompts:
+                console.print(f"  [cyan]►[/cyan] {prompt['label']} …", end="")
+                result = await run_prompt(
+                    client, model_name, model_id, prompt,
+                    provider_prefs, timeout_s, max_tokens,
+                )
+                all_results.append(result)
+
+                if result.error:
+                    console.print(f" [red]FAILED[/red]\n    [red]{result.error[:120]}[/red]")
+                else:
+                    ttft  = f"{result.ttft_s:.2f}s"   if result.ttft_s  else "—"
+                    total = f"{result.total_s:.2f}s"   if result.total_s else "—"
+                    cost  = f"${result.cost_usd:.6f}"  if result.cost_usd is not None else "n/a"
+                    tc_str = ""
+                    if result.tool_calls:
+                        names  = ", ".join(t["name"] for t in result.tool_calls)
+                        tc_str = f" [magenta]tool_calls=[{names}][/magenta]"
+                    elif prompt.get("tool_definitions"):
+                        tc_str = " [yellow]no tool call[/yellow]"
+                    console.print(f" [green]done[/green] [dim]ttft={ttft} total={total} cost={cost}[/dim]{tc_str}")
+
+    console.print()
+    print_leaderboard(all_results)
+    console.print()
+    print_summary_table(all_results)
+
+    results_dir = make_results_dir(run_name)
+    save_results(all_results, results_dir, config_path, cfg)
+    console.print(f"\n[dim]Results saved to {results_dir}/[/dim]")
+    console.print(f"[dim]  results.json · report.html · config.toml[/dim]")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Run OpenRouter model benchmarks.")
+    parser.add_argument(
+        "--config", type=Path,
+        default=Path(__file__).parent / "config" / "default.toml",
+        help="Path to TOML config file (default: config/default.toml)",
+    )
+    args = parser.parse_args()
+
+    if not args.config.exists():
+        sys.exit(f"Error: config file not found: {args.config}")
+
+    asyncio.run(main(args.config))

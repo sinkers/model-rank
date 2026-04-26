@@ -1,0 +1,7 @@
+{
+  "id": "weather",
+  "label": "Weather lookup",
+  "system_prompt": "tool_agent",
+  "tools": ["get_weather"],
+  "message": "What's the weather like in Sydney right now?"
+}

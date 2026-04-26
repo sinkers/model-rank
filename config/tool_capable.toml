@@ -1,0 +1,38 @@
+[run]
+name        = "tool-capable"
+description = "Models with verified tool/function-calling support, sorted by latency"
+
+[settings]
+max_tokens = 350
+timeout_s  = 120
+
+[[models]]
+name = "Claude Haiku"
+id   = "claude-haiku"
+[models.provider]
+sort = "latency"
+
+[[models]]
+name = "GPT-4o"
+id   = "openai/gpt-4o"
+[models.provider]
+sort = "latency"
+
+[[models]]
+name = "Llama 3.1 70B (Groq)"
+id   = "meta-llama/llama-3.1-70b-instruct"
+[models.provider]
+order           = ["Groq"]
+allow_fallbacks = false
+
+[[models]]
+name = "Mistral Small"
+id   = "mistral-small"
+[models.provider]
+sort = "latency"
+
+[[models]]
+name = "Qwen2.5 72B"
+id   = "qwen/qwen-2.5-72b-instruct"
+[models.provider]
+sort = "latency"

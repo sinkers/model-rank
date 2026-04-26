@@ -1,0 +1,7 @@
+{
+  "id": "web_search",
+  "label": "Web search",
+  "system_prompt": "tool_agent",
+  "tools": ["web_search"],
+  "message": "What are the most important AI news stories from this week?"
+}

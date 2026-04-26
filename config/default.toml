@@ -1,0 +1,64 @@
+[run]
+name        = "top10-latency"
+description = "Top 10 fastest endpoints by p50 latency (April 2026)"
+
+[settings]
+max_tokens = 350
+timeout_s  = 120
+# prompt_ids = ["schedule", "email", "plan", "recommend", "tasks"]  # run all if omitted
+
+[[models]]
+name = "Phi-4 (DeepInfra)"
+id   = "microsoft/phi-4"
+[models.provider]
+order           = ["DeepInfra"]
+allow_fallbacks = false
+
+[[models]]
+name = "Trinity Mini (Clarifai)"
+id   = "arcee-ai/trinity-mini"
+[models.provider]
+order           = ["Clarifai"]
+allow_fallbacks = false
+
+[[models]]
+name = "Llama 3.1 8B (Friendli)"
+id   = "meta-llama/llama-3.1-8b-instruct"
+[models.provider]
+order           = ["Friendli"]
+allow_fallbacks = false
+
+[[models]]
+name = "Lunaris 8B (DeepInfra)"
+id   = "sao10k/l3-lunaris-8b"
+[models.provider]
+order           = ["DeepInfra"]
+allow_fallbacks = false
+
+[[models]]
+name = "Ministral 3B (Mistral)"
+id   = "mistralai/ministral-3b-2512"
+[models.provider]
+order           = ["Mistral"]
+allow_fallbacks = false
+
+[[models]]
+name = "Llama 3.1 8B (Groq)"
+id   = "meta-llama/llama-3.1-8b-instruct"
+[models.provider]
+order           = ["Groq"]
+allow_fallbacks = false
+
+[[models]]
+name = "GPT-OSS 20B (Groq)"
+id   = "openai/gpt-oss-20b"
+[models.provider]
+order           = ["Groq"]
+allow_fallbacks = false
+
+[[models]]
+name = "Command R7B (Cohere)"
+id   = "cohere/command-r7b-12-2024"
+[models.provider]
+order           = ["Cohere"]
+allow_fallbacks = false

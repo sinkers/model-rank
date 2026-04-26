@@ -1,0 +1,22 @@
+{
+  "type": "function",
+  "function": {
+    "name": "get_weather",
+    "description": "Get the current weather conditions for a given location.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "type": "string",
+          "description": "City and country, e.g. 'Sydney, Australia'."
+        },
+        "units": {
+          "type": "string",
+          "enum": ["celsius", "fahrenheit"],
+          "description": "Temperature unit. Defaults to celsius."
+        }
+      },
+      "required": ["location"]
+    }
+  }
+}
