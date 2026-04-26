@@ -6,6 +6,15 @@ description = "Auto-discovered via discover.py"
 max_tokens = 350
 timeout_s  = 120
 
+# Reference model: should achieve 100% tool call success.
+# If tool calls fail here, investigate the test fixtures, not the models.
+[[models]]
+name     = "Claude Sonnet 4.6 (Anthropic) [reference]"
+id       = "anthropic/claude-sonnet-4.6"
+[models.provider]
+order            = ["Anthropic"]
+allow_fallbacks  = false
+
 [[models]]
 name     = "OpenAI: GPT-5.5 Pro (OpenAI)"
 id       = "openai/gpt-5.5-pro"
