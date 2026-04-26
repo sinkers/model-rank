@@ -1,38 +1,147 @@
 [run]
-name        = "tool-capable"
-description = "Models with verified tool/function-calling support, sorted by latency"
+name = "tool-capable"
+description = "Auto-discovered via discover.py"
 
 [settings]
 max_tokens = 350
 timeout_s  = 120
 
 [[models]]
-name = "Claude Haiku"
-id   = "claude-haiku"
+name     = "OpenAI: GPT-5.5 Pro (OpenAI)"
+id       = "openai/gpt-5.5-pro"
 [models.provider]
-sort = "latency"
+order            = ["OpenAI"]
+allow_fallbacks  = false
 
 [[models]]
-name = "GPT-4o"
-id   = "openai/gpt-4o"
+name     = "OpenAI: GPT-5.5 (OpenAI)"
+id       = "openai/gpt-5.5"
 [models.provider]
-sort = "latency"
+order            = ["OpenAI"]
+allow_fallbacks  = false
 
 [[models]]
-name = "Llama 3.1 70B (Groq)"
-id   = "meta-llama/llama-3.1-70b-instruct"
+name     = "DeepSeek: DeepSeek V4 Pro (DeepSeek)"
+id       = "deepseek/deepseek-v4-pro"
 [models.provider]
-order           = ["Groq"]
-allow_fallbacks = false
+order            = ["DeepSeek"]
+allow_fallbacks  = false
 
 [[models]]
-name = "Mistral Small"
-id   = "mistral-small"
+name     = "DeepSeek: DeepSeek V4 Pro (Together)"
+id       = "deepseek/deepseek-v4-pro"
 [models.provider]
-sort = "latency"
+order            = ["Together"]
+allow_fallbacks  = false
 
 [[models]]
-name = "Qwen2.5 72B"
-id   = "qwen/qwen-2.5-72b-instruct"
+name     = "DeepSeek: DeepSeek V4 Pro (Io Net)"
+id       = "deepseek/deepseek-v4-pro"
 [models.provider]
-sort = "latency"
+order            = ["Io Net"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "DeepSeek: DeepSeek V4 Flash (DeepSeek)"
+id       = "deepseek/deepseek-v4-flash"
+[models.provider]
+order            = ["DeepSeek"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "DeepSeek: DeepSeek V4 Flash (DeepInfra)"
+id       = "deepseek/deepseek-v4-flash"
+[models.provider]
+order            = ["DeepInfra"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "Xiaomi: MiMo-V2.5-Pro (Xiaomi)"
+id       = "xiaomi/mimo-v2.5-pro"
+[models.provider]
+order            = ["Xiaomi"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "Xiaomi: MiMo-V2.5 (Xiaomi)"
+id       = "xiaomi/mimo-v2.5"
+[models.provider]
+order            = ["Xiaomi"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Venice)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Venice"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (DeepInfra)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["DeepInfra"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Parasail)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Parasail"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Inceptron)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Inceptron"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Io Net)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Io Net"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Moonshot AI)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Moonshot AI"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Novita)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Novita"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (Cloudflare)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["Cloudflare"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (AtlasCloud)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["AtlasCloud"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (SiliconFlow)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["SiliconFlow"]
+allow_fallbacks  = false
+
+[[models]]
+name     = "MoonshotAI: Kimi K2.6 (BaseTen)"
+id       = "moonshotai/kimi-k2.6"
+[models.provider]
+order            = ["BaseTen"]
+allow_fallbacks  = false

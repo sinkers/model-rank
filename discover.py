@@ -24,7 +24,7 @@ if _env_path.exists():
         if _line.startswith("#") or "=" not in _line:
             continue
         _k, _v = _line.split("=", 1)
-        os.environ.setdefault(_k.strip(), _v.strip())
+        os.environ[_k.strip()] = _v.strip()
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not API_KEY:
@@ -70,9 +70,7 @@ async def discover(
                 for ep in endpoints:
                     lat = ep.get("latency_last_30m") or {}
                     thr = ep.get("throughput_last_30m") or {}
-                    p50 = lat.get("p50")
-                    if p50 is None:
-                        continue
+                    p50 = lat.get("p50")  # may be None if no recent data
 
                     supports_tools = any(
                         p in ep.get("supported_parameters", [])
@@ -97,7 +95,7 @@ async def discover(
                     })
 
     if sort_by == "latency":
-        results.sort(key=lambda e: e["p50_ms"])
+        results.sort(key=lambda e: (e["p50_ms"] is None, e["p50_ms"] or 0))
     elif sort_by == "throughput":
         results.sort(key=lambda e: -(e["thr_p50"] or 0))
     elif sort_by == "price":
